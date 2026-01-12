@@ -24,6 +24,7 @@ import {safePerformance} from '../core/safe-performance.js';
 import {clone} from '../core/utilities.js';
 import {anyNodeMatchesSelector, everyNodeMatchesSelector, getActiveModifiers, getActiveModifiersAndButtons, isPointInSelection} from '../dom/document-util.js';
 import {TextSourceElement} from '../dom/text-source-element.js';
+import {SudachiApiClient} from './sudachi-api.js';
 
 const SCAN_RESOLUTION_EXCLUDED_LANGUAGES = new Set(['ja', 'zh', 'yue', 'ko']);
 
@@ -176,6 +177,10 @@ export class TextScanner extends EventDispatcher {
         this._userHasNotSelectedAnythingManually = true;
         /** @type {boolean} */
         this._isMouseOverText = false;
+        /** @type {SudachiApiClient} */
+        this._sudachiApiClient = new SudachiApiClient();
+        /** @type {boolean} */
+        this._useSudachiApi = true; // Can be made configurable
     }
 
     /** @type {boolean} */
@@ -468,10 +473,13 @@ export class TextScanner extends EventDispatcher {
      * @param {boolean} searchTerms
      * @param {boolean} searchKanji
      * @param {import('text-scanner').InputInfo} inputInfo
-     * @param {boolean} showEmpty shows a "No results found" popup if no results are found
-     * @param {boolean} disallowExpandStartOffset disallows expanding the start offset of the range
+     * @param {string|null} [jishokei] The dictionary form from Sudachi API
+     * @param {number|null} [sourceLength] The length of the source text for highlighting
+     * @param {number} [backwardOffset] How many characters to move back from cursor to start of word
+     * @param {boolean} [showEmpty] shows a "No results found" popup if no results are found
+     * @param {boolean} [disallowExpandStartOffset] disallows expanding the start offset of the range
      */
-    async _search(textSource, searchTerms, searchKanji, inputInfo, showEmpty = false, disallowExpandStartOffset = false) {
+    async _search(textSource, searchTerms, searchKanji, inputInfo, jishokei = null, sourceLength = null, backwardOffset = 0, showEmpty = false, disallowExpandStartOffset = false) {
         try {
             safePerformance.mark('scanner:_search:start');
             const isAltText = textSource instanceof TextSourceElement;
@@ -516,7 +524,7 @@ export class TextScanner extends EventDispatcher {
             let sentence = null;
             /** @type {'terms'|'kanji'} */
             let type = 'terms';
-            const result = await this._findDictionaryEntries(textSource, searchTerms, searchKanji, optionsContext);
+            const result = await this._findDictionaryEntries(textSource, searchTerms, searchKanji, optionsContext, jishokei, sourceLength, backwardOffset);
             if (result !== null) {
                 ({dictionaryEntries, sentence, type} = result);
             } else if (showEmpty || (textSource !== null && isAltText && await this._isTextLookupWorthy(textSource.content))) {
@@ -1226,18 +1234,17 @@ export class TextScanner extends EventDispatcher {
      * @param {boolean} searchTerms
      * @param {boolean} searchKanji
      * @param {import('settings').OptionsContext} optionsContext
+     * @param {string|null} [jishokei]
+     * @param {number|null} [sourceLength]
+     * @param {number} [backwardOffset]
      * @returns {Promise<?import('text-scanner').SearchResults>}
      */
-    async _findDictionaryEntries(textSource, searchTerms, searchKanji, optionsContext) {
+    async _findDictionaryEntries(textSource, searchTerms, searchKanji, optionsContext, jishokei = null, sourceLength = null, backwardOffset = 0) {
         if (textSource === null) {
             return null;
         }
         if (searchTerms) {
-            const results = await this._findTermDictionaryEntries(textSource, optionsContext);
-            if (results !== null) { return results; }
-        }
-        if (searchKanji) {
-            const results = await this._findKanjiDictionaryEntries(textSource, optionsContext);
+            const results = await this._findTermDictionaryEntries(textSource, optionsContext, jishokei, sourceLength, backwardOffset);
             if (results !== null) { return results; }
         }
         return null;
@@ -1246,9 +1253,11 @@ export class TextScanner extends EventDispatcher {
     /**
      * @param {import('text-source').TextSource} textSource
      * @param {import('settings').OptionsContext} optionsContext
+     * @param {string|null} [jishokei]
+     * @param {number|null} [sourceLength]
      * @returns {Promise<?import('text-scanner').TermSearchResults>}
      */
-    async _findTermDictionaryEntries(textSource, optionsContext) {
+    async _findTermDictionaryEntries(textSource, optionsContext, jishokei = null, sourceLength = null, backwardOffset = 0) {
         const scanLength = this._scanLength;
         const sentenceScanExtent = this._sentenceScanExtent;
         const sentenceTerminateAtNewlines = this._sentenceTerminateAtNewlines;
@@ -1256,7 +1265,14 @@ export class TextScanner extends EventDispatcher {
         const sentenceForwardQuoteMap = this._sentenceForwardQuoteMap;
         const sentenceBackwardQuoteMap = this._sentenceBackwardQuoteMap;
         const layoutAwareScan = this._layoutAwareScan;
-        const searchText = this.getTextSourceContent(textSource, scanLength, layoutAwareScan, optionsContext.pointerType);
+
+        // 如果使用 Sudachi API 且需要往前移动，调整 textSource 的起始位置
+        if (jishokei !== null && backwardOffset > 0) {
+            textSource.setStartOffset(backwardOffset, layoutAwareScan);
+        }
+
+        // Use jishokei from Sudachi API if available, otherwise extract from textSource
+        const searchText = jishokei ?? this.getTextSourceContent(textSource, scanLength, layoutAwareScan, optionsContext.pointerType);
         if (searchText.length === 0) { return null; }
 
         /** @type {import('api').FindTermsDetails} */
@@ -1264,7 +1280,10 @@ export class TextScanner extends EventDispatcher {
         const {dictionaryEntries, originalTextLength} = await this._api.termsFind(searchText, details, optionsContext);
         if (dictionaryEntries.length === 0) { return null; }
 
-        textSource.setEndOffset(originalTextLength, false, layoutAwareScan);
+        // Use sourceLength from Sudachi API for highlighting, otherwise use originalTextLength from dictionary
+        const highlightLength = sourceLength ?? originalTextLength;
+        textSource.setEndOffset(highlightLength, false, layoutAwareScan);
+
         const sentence = this._textSourceGenerator.extractSentence(
             textSource,
             layoutAwareScan,
@@ -1343,7 +1362,8 @@ export class TextScanner extends EventDispatcher {
             if (textSource !== null) {
                 try {
                     this._isMouseOverText = true;
-                    await this._search(textSource, searchTerms, searchKanji, inputInfo);
+                    // Integrate Sudachi API for Japanese text
+                    await (this._searchWithSudachi(textSource, searchTerms, searchKanji, inputInfo));
                 } finally {
                     textSource.cleanup();
                 }
@@ -1374,6 +1394,49 @@ export class TextScanner extends EventDispatcher {
         }
 
         await this._searchAt(x, y, inputInfo);
+    }
+
+    /**
+     * Search using Sudachi API for better Japanese morphological analysis.
+     * @param {import('text-source').TextSource} textSource
+     * @param {boolean} searchTerms
+     * @param {boolean} searchKanji
+     * @param {import('text-scanner').InputInfo} inputInfo
+     */
+    async _searchWithSudachi(textSource, searchTerms, searchKanji, inputInfo) {
+        const sentenceResult = this._textSourceGenerator.extractSentence(
+            textSource,
+            this._layoutAwareScan,
+            this._sentenceScanExtent,
+            this._sentenceTerminateAtNewlines,
+            this._sentenceTerminatorMap,
+            this._sentenceForwardQuoteMap,
+            this._sentenceBackwardQuoteMap,
+        );
+
+        const sentence = sentenceResult.text;
+        const cursorIndex = sentenceResult.offset;
+        log.log('_searchWithSudachi - sentence:', JSON.stringify(sentence), 'cursorIndex:', cursorIndex);
+
+        if (sentence && cursorIndex >= 0) {
+            try {
+                log.log('Sudachi API: ' + sentence);
+                const result = await this._sudachiApiClient.getJishokei(sentence, cursorIndex);
+                if (result !== null) {
+                    log.log(`Sudachi API returned: ${result.jishokei}, length: ${result.length}, offset: ${result.offset}`);
+                    // 计算需要往前移动多少位置来高亮整个单词
+                    const backwardOffset = cursorIndex - result.offset;
+                    await this._search(textSource, searchTerms, searchKanji, inputInfo, result.jishokei, result.length, backwardOffset);
+                    return;
+                }
+            } catch (error) {
+                log.error(`Sudachi API failed, falling back to standard search: ${error}`);
+            }
+        }
+
+        // Fallback to standard search
+        log.log('_searchWithSudachi - falling back to standard search');
+        await this._search(textSource, searchTerms, searchKanji, inputInfo, null, null, 0);
     }
 
     /**
